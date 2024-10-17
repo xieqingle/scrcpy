@@ -1,10 +1,13 @@
 package com.genymobile.scrcpy;
 
-import com.genymobile.scrcpy.wrappers.ContentProvider;
-import com.genymobile.scrcpy.wrappers.ServiceManager;
+import com.genymobile.scrcpy.device.Device;
+import com.genymobile.scrcpy.util.Ln;
+import com.genymobile.scrcpy.util.Settings;
+import com.genymobile.scrcpy.util.SettingsException;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
 
 /**
  * Handle the cleanup of scrcpy, even if the main process is killed.
@@ -13,34 +16,64 @@ import java.io.IOException;
  */
 public final class CleanUp {
 
-    public static final String SERVER_PATH = "/data/local/tmp/scrcpy-server.jar";
+    private static final int MSG_TYPE_MASK = 0b11;
+    private static final int MSG_TYPE_RESTORE_STAY_ON = 0;
+    private static final int MSG_TYPE_DISABLE_SHOW_TOUCHES = 1;
+    private static final int MSG_TYPE_RESTORE_NORMAL_POWER_MODE = 2;
+    private static final int MSG_TYPE_POWER_OFF_SCREEN = 3;
 
-    private CleanUp() {
-        // not instantiable
+    private static final int MSG_PARAM_SHIFT = 2;
+
+    private final OutputStream out;
+
+    public CleanUp(OutputStream out) {
+        this.out = out;
     }
 
-    public static void configure(boolean disableShowTouches, int restoreStayOn, boolean restoreNormalPowerMode) throws IOException {
-        boolean needProcess = disableShowTouches || restoreStayOn != -1 || restoreNormalPowerMode;
-        if (needProcess) {
-            startProcess(disableShowTouches, restoreStayOn, restoreNormalPowerMode);
-        } else {
-            // There is no additional clean up to do when scrcpy dies
-            unlinkSelf();
+    public static CleanUp configure(int displayId) throws IOException {
+        String[] cmd = {"app_process", "/", CleanUp.class.getName(), String.valueOf(displayId)};
+
+        ProcessBuilder builder = new ProcessBuilder(cmd);
+        builder.environment().put("CLASSPATH", Server.SERVER_PATH);
+        Process process = builder.start();
+        return new CleanUp(process.getOutputStream());
+    }
+
+    private boolean sendMessage(int type, int param) {
+        assert (type & ~MSG_TYPE_MASK) == 0;
+        int msg = type | param << MSG_PARAM_SHIFT;
+        try {
+            out.write(msg);
+            out.flush();
+            return true;
+        } catch (IOException e) {
+            Ln.w("Could not configure cleanup (type=" + type + ", param=" + param + ")", e);
+            return false;
         }
     }
 
-    private static void startProcess(boolean disableShowTouches, int restoreStayOn, boolean restoreNormalPowerMode) throws IOException {
-        String[] cmd = {"app_process", "/", CleanUp.class.getName(), String.valueOf(disableShowTouches), String.valueOf(
-                restoreStayOn), String.valueOf(restoreNormalPowerMode)};
-
-        ProcessBuilder builder = new ProcessBuilder(cmd);
-        builder.environment().put("CLASSPATH", SERVER_PATH);
-        builder.start();
+    public boolean setRestoreStayOn(int restoreValue) {
+        // Restore the value (between 0 and 7), -1 to not restore
+        // <https://developer.android.com/reference/android/provider/Settings.Global#STAY_ON_WHILE_PLUGGED_IN>
+        assert restoreValue >= -1 && restoreValue <= 7;
+        return sendMessage(MSG_TYPE_RESTORE_STAY_ON, restoreValue & 0b1111);
     }
 
-    private static void unlinkSelf() {
+    public boolean setDisableShowTouches(boolean disableOnExit) {
+        return sendMessage(MSG_TYPE_DISABLE_SHOW_TOUCHES, disableOnExit ? 1 : 0);
+    }
+
+    public boolean setRestoreNormalPowerMode(boolean restoreOnExit) {
+        return sendMessage(MSG_TYPE_RESTORE_NORMAL_POWER_MODE, restoreOnExit ? 1 : 0);
+    }
+
+    public boolean setPowerOffScreen(boolean powerOffScreenOnExit) {
+        return sendMessage(MSG_TYPE_POWER_OFF_SCREEN, powerOffScreenOnExit ? 1 : 0);
+    }
+
+    public static void unlinkSelf() {
         try {
-            new File(SERVER_PATH).delete();
+            new File(Server.SERVER_PATH).delete();
         } catch (Exception e) {
             Ln.e("Could not unlink server", e);
         }
@@ -49,36 +82,71 @@ public final class CleanUp {
     public static void main(String... args) {
         unlinkSelf();
 
+        int displayId = Integer.parseInt(args[0]);
+
+        int restoreStayOn = -1;
+        boolean disableShowTouches = false;
+        boolean restoreNormalPowerMode = false;
+        boolean powerOffScreen = false;
+
         try {
             // Wait for the server to die
-            System.in.read();
+            int msg;
+            while ((msg = System.in.read()) != -1) {
+                int type = msg & MSG_TYPE_MASK;
+                int param = msg >> MSG_PARAM_SHIFT;
+                switch (type) {
+                    case MSG_TYPE_RESTORE_STAY_ON:
+                        restoreStayOn = param > 7 ? -1 : param;
+                        break;
+                    case MSG_TYPE_DISABLE_SHOW_TOUCHES:
+                        disableShowTouches = param != 0;
+                        break;
+                    case MSG_TYPE_RESTORE_NORMAL_POWER_MODE:
+                        restoreNormalPowerMode = param != 0;
+                        break;
+                    case MSG_TYPE_POWER_OFF_SCREEN:
+                        powerOffScreen = param != 0;
+                        break;
+                    default:
+                        Ln.w("Unexpected msg type: " + type);
+                        break;
+                }
+            }
         } catch (IOException e) {
             // Expected when the server is dead
         }
 
         Ln.i("Cleaning up");
 
-        boolean disableShowTouches = Boolean.parseBoolean(args[0]);
-        int restoreStayOn = Integer.parseInt(args[1]);
-        boolean restoreNormalPowerMode = Boolean.parseBoolean(args[2]);
-
-        if (disableShowTouches || restoreStayOn != -1) {
-            ServiceManager serviceManager = new ServiceManager();
-            try (ContentProvider settings = serviceManager.getActivityManager().createSettingsProvider()) {
-                if (disableShowTouches) {
-                    Ln.i("Disabling \"show touches\"");
-                    settings.putValue(ContentProvider.TABLE_SYSTEM, "show_touches", "0");
-                }
-                if (restoreStayOn != -1) {
-                    Ln.i("Restoring \"stay awake\"");
-                    settings.putValue(ContentProvider.TABLE_GLOBAL, "stay_on_while_plugged_in", String.valueOf(restoreStayOn));
-                }
+        if (disableShowTouches) {
+            Ln.i("Disabling \"show touches\"");
+            try {
+                Settings.putValue(Settings.TABLE_SYSTEM, "show_touches", "0");
+            } catch (SettingsException e) {
+                Ln.e("Could not restore \"show_touches\"", e);
             }
         }
 
-        if (restoreNormalPowerMode) {
-            Ln.i("Restoring normal power mode");
-            Device.setScreenPowerMode(Device.POWER_MODE_NORMAL);
+        if (restoreStayOn != -1) {
+            Ln.i("Restoring \"stay awake\"");
+            try {
+                Settings.putValue(Settings.TABLE_GLOBAL, "stay_on_while_plugged_in", String.valueOf(restoreStayOn));
+            } catch (SettingsException e) {
+                Ln.e("Could not restore \"stay_on_while_plugged_in\"", e);
+            }
         }
+
+        if (Device.isScreenOn()) {
+            if (powerOffScreen) {
+                Ln.i("Power off screen");
+                Device.powerOffScreen(displayId);
+            } else if (restoreNormalPowerMode) {
+                Ln.i("Restoring normal power mode");
+                Device.setScreenPowerMode(Device.POWER_MODE_NORMAL);
+            }
+        }
+
+        System.exit(0);
     }
 }

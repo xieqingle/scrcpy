@@ -1,24 +1,19 @@
 # Frequently Asked Questions
 
+[Read in another language](#translations)
+
 Here are the common reported problems and their status.
 
+If you encounter any error, the first step is to upgrade to the latest version.
 
-## `adb` issues
+
+## `adb` and USB issues
 
 `scrcpy` execute `adb` commands to initialize the connection with the device. If
 `adb` fails, then scrcpy will not work.
 
-In that case, it will print this error:
-
->     ERROR: "adb push" returned with value 1
-
 This is typically not a bug in _scrcpy_, but a problem in your environment.
 
-To find out the cause, execute:
-
-```bash
-adb devices
-```
 
 ### `adb` not found
 
@@ -28,35 +23,63 @@ On Windows, the current directory is in your `PATH`, and `adb.exe` is included
 in the release, so it should work out-of-the-box.
 
 
-### Device unauthorized
-
-Check [stackoverflow][device-unauthorized].
-
-[device-unauthorized]: https://stackoverflow.com/questions/23081263/adb-android-device-unauthorized
-
-
 ### Device not detected
 
->     adb: error: failed to get feature set: no devices/emulators found
+>     ERROR: Could not find any ADB device
 
-If your device is not detected, you may need some [drivers] (on Windows).
+Check that you correctly enabled [adb debugging][enable-adb].
 
+Your device must be detected by `adb`:
+
+```
+adb devices
+```
+
+If your device is not detected, you may need some [drivers] (on Windows). There is a separate [USB driver for Google devices][google-usb-driver].
+
+[enable-adb]: https://developer.android.com/studio/command-line/adb.html#Enabling
 [drivers]: https://developer.android.com/studio/run/oem-usb.html
+[google-usb-driver]: https://developer.android.com/studio/run/win-usb
+
+
+### Device unauthorized
+
+>     ERROR: Device is unauthorized:
+>     ERROR:     -->   (usb)  0123456789abcdef          unauthorized
+>     ERROR: A popup should open on the device to request authorization.
+
+When connecting, a popup should open on the device. You must authorize USB
+debugging.
+
+If it does not open, check [stackoverflow][device-unauthorized].
+
+[device-unauthorized]: https://stackoverflow.com/questions/23081263/adb-android-device-unauthorized
 
 
 ### Several devices connected
 
 If several devices are connected, you will encounter this error:
 
->     adb: error: failed to get feature set: more than one device/emulator
+>     ERROR: Multiple (2) ADB devices:
+>     ERROR:     -->   (usb)  0123456789abcdef                device  Nexus_5
+>     ERROR:     --> (tcpip)  192.168.1.5:5555                device  GM1913
+>     ERROR: Select a device via -s (--serial), -d (--select-usb) or -e (--select-tcpip)
 
-the identifier of the device you want to mirror must be provided:
+In that case, you can either provide the identifier of the device you want to
+mirror:
 
 ```bash
-scrcpy -s 01234567890abcdef
+scrcpy -s 0123456789abcdef
 ```
 
-Note that if your device is connected over TCP/IP, you'll get this message:
+Or request the single USB (or TCP/IP) device:
+
+```bash
+scrcpy -d  # USB device
+scrcpy -e  # TCP/IP device
+```
+
+Note that if your device is connected over TCP/IP, you might get this message:
 
 >     adb: error: more than one device/emulator
 >     ERROR: "adb reverse" returned with value 1
@@ -80,7 +103,20 @@ You could overwrite the `adb` binary in the other program, or ask _scrcpy_ to
 use a specific `adb` binary, by setting the `ADB` environment variable:
 
 ```bash
-set ADB=/path/to/your/adb
+# in bash
+export ADB=/path/to/your/adb
+scrcpy
+```
+
+```cmd
+:: in cmd
+set ADB=C:\path\to\your\adb.exe
+scrcpy
+```
+
+```powershell
+# in PowerShell
+$env:ADB = 'C:\path\to\your\adb.exe'
 scrcpy
 ```
 
@@ -97,6 +133,21 @@ Try with another USB cable or plug it into another USB port. See [#281] and
 [#283]: https://github.com/Genymobile/scrcpy/issues/283
 
 
+## OTG issues on Windows
+
+On Windows, if `scrcpy --otg` (or `--keyboard=aoa`/`--mouse=aoa`) results in:
+
+>     ERROR: Could not find any USB device
+
+(or if only unrelated USB devices are detected), there might be drivers issues.
+
+Please read [#3654], in particular [this comment][#3654-comment1] and [the next
+one][#3654-comment2].
+
+[#3654]: https://github.com/Genymobile/scrcpy/issues/3654
+[#3654-comment1]: https://github.com/Genymobile/scrcpy/issues/3654#issuecomment-1369278232
+[#3654-comment2]: https://github.com/Genymobile/scrcpy/issues/3654#issuecomment-1369295011
+
 
 ## Control issues
 
@@ -108,55 +159,47 @@ In developer options, enable:
 > **USB debugging (Security settings)**  
 > _Allow granting permissions and simulating input via USB debugging_
 
+Rebooting the device is necessary once this option is set.
+
 [simulating input]: https://github.com/Genymobile/scrcpy/issues/70#issuecomment-373286323
-
-
-### Mouse clicks at wrong location
-
-On MacOS, with HiDPI support and multiple screens, input location are wrongly
-scaled. See [#15].
-
-[#15]: https://github.com/Genymobile/scrcpy/issues/15
-
-Open _scrcpy_ directly on the monitor you use it.
 
 
 ### Special characters do not work
 
-Injecting text input is [limited to ASCII characters][text-input]. A trick
-allows to also inject some [accented characters][accented-characters], but
-that's all. See [#37].
+The default text injection method is [limited to ASCII characters][text-input].
+A trick allows to also inject some [accented characters][accented-characters],
+but that's all. See [#37].
+
+To avoid the problem, [change the keyboard mode to simulate a physical
+keyboard][hid].
 
 [text-input]: https://github.com/Genymobile/scrcpy/issues?q=is%3Aopen+is%3Aissue+label%3Aunicode
 [accented-characters]: https://blog.rom1v.com/2018/03/introducing-scrcpy/#handle-accented-characters
 [#37]: https://github.com/Genymobile/scrcpy/issues/37
+[hid]: doc/keyboard.md#physical-keyboard-simulation
 
 
 ## Client issues
 
-### The quality is low
+### Issue with Wayland
 
-If the definition of your client window is smaller than that of your device
-screen, then you might get poor quality, especially visible on text (see [#40]).
+By default, SDL uses x11 on Linux. The [video driver] can be changed via the
+`SDL_VIDEODRIVER` environment variable:
 
-[#40]: https://github.com/Genymobile/scrcpy/issues/40
+[video driver]: https://wiki.libsdl.org/FAQUsingSDL#how_do_i_choose_a_specific_video_driver
 
-To improve downscaling quality, trilinear filtering is enabled automatically
-if the renderer is OpenGL and if it supports mipmapping.
-
-On Windows, you might want to force OpenGL:
-
-```
-scrcpy --render-driver=opengl
+```bash
+export SDL_VIDEODRIVER=wayland
+scrcpy
 ```
 
-You may also need to configure the [scaling behavior]:
+On some distributions (at least Fedora), the package `libdecor` must be
+installed manually.
 
-> `scrcpy.exe` > Properties > Compatibility > Change high DPI settings >
-> Override high DPI scaling behavior > Scaling performed by: _Application_.
+See issues [#2554] and [#2559].
 
-[scaling behavior]: https://github.com/Genymobile/scrcpy/issues/40#issuecomment-424466723
-
+[#2554]: https://github.com/Genymobile/scrcpy/issues/2554
+[#2559]: https://github.com/Genymobile/scrcpy/issues/2559
 
 
 ### KWin compositor crashes
@@ -172,30 +215,21 @@ As a workaround, [disable "Block compositing"][kwin].
 
 ### Exception
 
-There may be many reasons. One common cause is that the hardware encoder of your
-device is not able to encode at the given definition:
-
-> ```
-> ERROR: Exception on thread Thread[main,5,main]
-> android.media.MediaCodec$CodecException: Error 0xfffffc0e
-> ...
-> Exit due to uncaughtException in main thread:
-> ERROR: Could not open video stream
-> INFO: Initial texture: 1080x2336
-> ```
-
-or
-
-> ```
-> ERROR: Exception on thread Thread[main,5,main]
-> java.lang.IllegalStateException
->         at android.media.MediaCodec.native_dequeueOutputBuffer(Native Method)
-> ```
-
-Just try with a lower definition:
+If you get any exception related to `MediaCodec`:
 
 ```
-scrcpy -m 1920
-scrcpy -m 1024
-scrcpy -m 800
+ERROR: Exception on thread Thread[main,5,main]
+java.lang.IllegalStateException
+        at android.media.MediaCodec.native_dequeueOutputBuffer(Native Method)
 ```
+
+then try with another [encoder](doc/video.md#encoder).
+
+
+## Translations
+
+Translations of this FAQ in other languages are available in the [wiki].
+
+[wiki]: https://github.com/Genymobile/scrcpy/wiki
+
+Only this FAQ file is guaranteed to be up-to-date.

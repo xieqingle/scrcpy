@@ -1,108 +1,155 @@
-#include "scrcpy.h"
+#include "common.h"
 
 #include <assert.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <libavformat/avformat.h>
+#ifdef HAVE_V4L2
+# include <libavdevice/avdevice.h>
+#endif
 #define SDL_MAIN_HANDLED // avoid link error on Linux Windows Subsystem
 #include <SDL2/SDL.h>
 
-#include "config.h"
 #include "cli.h"
-#include "compat.h"
+#include "options.h"
+#include "scrcpy.h"
+#include "usb/scrcpy_otg.h"
 #include "util/log.h"
+#include "util/net.h"
+#include "util/thread.h"
+#include "version.h"
 
-static void
-print_version(void) {
-    fprintf(stderr, "scrcpy %s\n\n", SCRCPY_VERSION);
+#ifdef _WIN32
+#include <windows.h>
+#include "util/str.h"
+#endif
 
-    fprintf(stderr, "dependencies:\n");
-    fprintf(stderr, " - SDL %d.%d.%d\n", SDL_MAJOR_VERSION, SDL_MINOR_VERSION,
-                                         SDL_PATCHLEVEL);
-    fprintf(stderr, " - libavcodec %d.%d.%d\n", LIBAVCODEC_VERSION_MAJOR,
-                                                LIBAVCODEC_VERSION_MINOR,
-                                                LIBAVCODEC_VERSION_MICRO);
-    fprintf(stderr, " - libavformat %d.%d.%d\n", LIBAVFORMAT_VERSION_MAJOR,
-                                                 LIBAVFORMAT_VERSION_MINOR,
-                                                 LIBAVFORMAT_VERSION_MICRO);
-    fprintf(stderr, " - libavutil %d.%d.%d\n", LIBAVUTIL_VERSION_MAJOR,
-                                               LIBAVUTIL_VERSION_MINOR,
-                                               LIBAVUTIL_VERSION_MICRO);
-}
-
-static SDL_LogPriority
-convert_log_level_to_sdl(enum sc_log_level level) {
-    switch (level) {
-        case SC_LOG_LEVEL_DEBUG:
-            return SDL_LOG_PRIORITY_DEBUG;
-        case SC_LOG_LEVEL_INFO:
-            return SDL_LOG_PRIORITY_INFO;
-        case SC_LOG_LEVEL_WARN:
-            return SDL_LOG_PRIORITY_WARN;
-        case SC_LOG_LEVEL_ERROR:
-            return SDL_LOG_PRIORITY_ERROR;
-        default:
-            assert(!"unexpected log level");
-            return SDL_LOG_PRIORITY_INFO;
-    }
-}
-
-
-int
-main(int argc, char *argv[]) {
-#ifdef __WINDOWS__
+static int
+main_scrcpy(int argc, char *argv[]) {
+#ifdef _WIN32
     // disable buffering, we want logs immediately
     // even line buffering (setvbuf() with mode _IOLBF) is not sufficient
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 #endif
 
+    printf("scrcpy " SCRCPY_VERSION
+           " <https://github.com/Genymobile/scrcpy>\n");
+
     struct scrcpy_cli_args args = {
-        .opts = SCRCPY_OPTIONS_DEFAULT,
+        .opts = scrcpy_options_default,
         .help = false,
         .version = false,
+        .pause_on_exit = SC_PAUSE_ON_EXIT_FALSE,
     };
 
 #ifndef NDEBUG
     args.opts.log_level = SC_LOG_LEVEL_DEBUG;
 #endif
 
+    enum scrcpy_exit_code ret;
+
     if (!scrcpy_parse_args(&args, argc, argv)) {
-        return 1;
+        ret = SCRCPY_EXIT_FAILURE;
+        goto end;
     }
 
-    SDL_LogPriority sdl_log = convert_log_level_to_sdl(args.opts.log_level);
-    SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, sdl_log);
+    sc_set_log_level(args.opts.log_level);
 
     if (args.help) {
         scrcpy_print_usage(argv[0]);
-        return 0;
+        ret = SCRCPY_EXIT_SUCCESS;
+        goto end;
     }
 
     if (args.version) {
-        print_version();
-        return 0;
+        scrcpy_print_version();
+        ret = SCRCPY_EXIT_SUCCESS;
+        goto end;
     }
 
-    LOGI("scrcpy " SCRCPY_VERSION " <https://github.com/Genymobile/scrcpy>");
+    // The current thread is the main thread
+    SC_MAIN_THREAD_ID = sc_thread_get_id();
 
 #ifdef SCRCPY_LAVF_REQUIRES_REGISTER_ALL
     av_register_all();
 #endif
 
-    if (avformat_network_init()) {
-        return 1;
-    }
-
-    int res = scrcpy(&args.opts) ? 0 : 1;
-
-    avformat_network_deinit(); // ignore failure
-
-#if defined (__WINDOWS__) && ! defined (WINDOWS_NOCONSOLE)
-    if (res != 0) {
-        fprintf(stderr, "Press any key to continue...\n");
-        getchar();
+#ifdef HAVE_V4L2
+    if (args.opts.v4l2_device) {
+        avdevice_register_all();
     }
 #endif
-    return res;
+
+    if (!net_init()) {
+        ret = SCRCPY_EXIT_FAILURE;
+        goto end;
+    }
+
+    sc_log_configure();
+
+#ifdef HAVE_USB
+    ret = args.opts.otg ? scrcpy_otg(&args.opts) : scrcpy(&args.opts);
+#else
+    ret = scrcpy(&args.opts);
+#endif
+
+end:
+    if (args.pause_on_exit == SC_PAUSE_ON_EXIT_TRUE ||
+            (args.pause_on_exit == SC_PAUSE_ON_EXIT_IF_ERROR &&
+                ret != SCRCPY_EXIT_SUCCESS)) {
+        printf("Press Enter to continue...\n");
+        getchar();
+    }
+
+    return ret;
+}
+
+int
+main(int argc, char *argv[]) {
+#ifndef _WIN32
+    return main_scrcpy(argc, argv);
+#else
+    (void) argc;
+    (void) argv;
+    int wargc;
+    wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) {
+        LOG_OOM();
+        return SCRCPY_EXIT_FAILURE;
+    }
+
+    char **argv_utf8 = malloc((wargc + 1) * sizeof(*argv_utf8));
+    if (!argv_utf8) {
+        LOG_OOM();
+        LocalFree(wargv);
+        return SCRCPY_EXIT_FAILURE;
+    }
+
+    argv_utf8[wargc] = NULL;
+
+    for (int i = 0; i < wargc; ++i) {
+        argv_utf8[i] = sc_str_from_wchars(wargv[i]);
+        if (!argv_utf8[i]) {
+            LOG_OOM();
+            for (int j = 0; j < i; ++j) {
+                free(argv_utf8[j]);
+            }
+            LocalFree(wargv);
+            free(argv_utf8);
+            return SCRCPY_EXIT_FAILURE;
+        }
+    }
+
+    LocalFree(wargv);
+
+    int ret = main_scrcpy(wargc, argv_utf8);
+
+    for (int i = 0; i < wargc; ++i) {
+        free(argv_utf8[i]);
+    }
+    free(argv_utf8);
+
+    return ret;
+#endif
 }

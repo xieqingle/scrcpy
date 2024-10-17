@@ -1,15 +1,19 @@
 package com.genymobile.scrcpy.wrappers;
 
-import com.genymobile.scrcpy.Ln;
+import com.genymobile.scrcpy.FakeContext;
+import com.genymobile.scrcpy.util.Ln;
+import com.genymobile.scrcpy.util.SettingsException;
 
+import android.annotation.SuppressLint;
+import android.content.AttributionSource;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
 
 import java.io.Closeable;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
-public class ContentProvider implements Closeable {
+public final class ContentProvider implements Closeable {
 
     public static final String TABLE_SYSTEM = "system";
     public static final String TABLE_SECURE = "secure";
@@ -35,7 +39,7 @@ public class ContentProvider implements Closeable {
     private final IBinder token;
 
     private Method callMethod;
-    private boolean callMethodLegacy;
+    private int callMethodVersion;
 
     ContentProvider(ActivityManager manager, Object provider, String name, IBinder token) {
         this.manager = manager;
@@ -44,32 +48,56 @@ public class ContentProvider implements Closeable {
         this.token = token;
     }
 
+    @SuppressLint("PrivateApi")
     private Method getCallMethod() throws NoSuchMethodException {
         if (callMethod == null) {
-            try {
-                callMethod = provider.getClass().getMethod("call", String.class, String.class, String.class, String.class, Bundle.class);
-            } catch (NoSuchMethodException e) {
-                // old version
-                callMethod = provider.getClass().getMethod("call", String.class, String.class, String.class, Bundle.class);
-                callMethodLegacy = true;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                callMethod = provider.getClass().getMethod("call", AttributionSource.class, String.class, String.class, String.class, Bundle.class);
+                callMethodVersion = 0;
+            } else {
+                // old versions
+                try {
+                    callMethod = provider.getClass()
+                            .getMethod("call", String.class, String.class, String.class, String.class, String.class, Bundle.class);
+                    callMethodVersion = 1;
+                } catch (NoSuchMethodException e1) {
+                    try {
+                        callMethod = provider.getClass().getMethod("call", String.class, String.class, String.class, String.class, Bundle.class);
+                        callMethodVersion = 2;
+                    } catch (NoSuchMethodException e2) {
+                        callMethod = provider.getClass().getMethod("call", String.class, String.class, String.class, Bundle.class);
+                        callMethodVersion = 3;
+                    }
+                }
             }
         }
         return callMethod;
     }
 
-    private Bundle call(String callMethod, String arg, Bundle extras) {
+    private Bundle call(String callMethod, String arg, Bundle extras) throws ReflectiveOperationException {
         try {
             Method method = getCallMethod();
             Object[] args;
-            if (!callMethodLegacy) {
-                args = new Object[]{ServiceManager.PACKAGE_NAME, "settings", callMethod, arg, extras};
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && callMethodVersion == 0) {
+                args = new Object[]{FakeContext.get().getAttributionSource(), "settings", callMethod, arg, extras};
             } else {
-                args = new Object[]{ServiceManager.PACKAGE_NAME, callMethod, arg, extras};
+                switch (callMethodVersion) {
+                    case 1:
+                        args = new Object[]{FakeContext.PACKAGE_NAME, null, "settings", callMethod, arg, extras};
+                        break;
+                    case 2:
+                        args = new Object[]{FakeContext.PACKAGE_NAME, "settings", callMethod, arg, extras};
+                        break;
+                    default:
+                        args = new Object[]{FakeContext.PACKAGE_NAME, callMethod, arg, extras};
+                        break;
+                }
             }
             return (Bundle) method.invoke(provider, args);
-        } catch (InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
+        } catch (ReflectiveOperationException e) {
             Ln.e("Could not invoke method", e);
-            return null;
+            throw e;
         }
     }
 
@@ -103,30 +131,31 @@ public class ContentProvider implements Closeable {
         }
     }
 
-    public String getValue(String table, String key) {
+    public String getValue(String table, String key) throws SettingsException {
         String method = getGetMethod(table);
         Bundle arg = new Bundle();
-        arg.putInt(CALL_METHOD_USER_KEY, ServiceManager.USER_ID);
-        Bundle bundle = call(method, key, arg);
-        if (bundle == null) {
-            return null;
+        arg.putInt(CALL_METHOD_USER_KEY, FakeContext.ROOT_UID);
+        try {
+            Bundle bundle = call(method, key, arg);
+            if (bundle == null) {
+                return null;
+            }
+            return bundle.getString("value");
+        } catch (Exception e) {
+            throw new SettingsException(table, "get", key, null, e);
         }
-        return bundle.getString("value");
+
     }
 
-    public void putValue(String table, String key, String value) {
+    public void putValue(String table, String key, String value) throws SettingsException {
         String method = getPutMethod(table);
         Bundle arg = new Bundle();
-        arg.putInt(CALL_METHOD_USER_KEY, ServiceManager.USER_ID);
+        arg.putInt(CALL_METHOD_USER_KEY, FakeContext.ROOT_UID);
         arg.putString(NAME_VALUE_TABLE_VALUE, value);
-        call(method, key, arg);
-    }
-
-    public String getAndPutValue(String table, String key, String value) {
-        String oldValue = getValue(table, key);
-        if (!value.equals(oldValue)) {
-            putValue(table, key, value);
+        try {
+            call(method, key, arg);
+        } catch (Exception e) {
+            throw new SettingsException(table, "put", key, value, e);
         }
-        return oldValue;
     }
 }

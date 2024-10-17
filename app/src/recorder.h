@@ -1,67 +1,87 @@
-#ifndef RECORDER_H
-#define RECORDER_H
+#ifndef SC_RECORDER_H
+#define SC_RECORDER_H
+
+#include "common.h"
 
 #include <stdbool.h>
 #include <libavformat/avformat.h>
-#include <SDL2/SDL_mutex.h>
-#include <SDL2/SDL_thread.h>
 
-#include "config.h"
-#include "common.h"
-#include "scrcpy.h"
-#include "util/queue.h"
+#include "coords.h"
+#include "options.h"
+#include "trait/packet_sink.h"
+#include "util/thread.h"
+#include "util/vecdeque.h"
 
-struct record_packet {
-    AVPacket packet;
-    struct record_packet *next;
+struct sc_recorder_queue SC_VECDEQUE(AVPacket *);
+
+struct sc_recorder_stream {
+    int index;
+    int64_t last_pts;
 };
 
-struct recorder_queue QUEUE(struct record_packet);
+struct sc_recorder {
+    struct sc_packet_sink video_packet_sink;
+    struct sc_packet_sink audio_packet_sink;
 
-struct recorder {
+    /* The audio flag is unprotected:
+     *  - it is initialized from sc_recorder_init() from the main thread;
+     *  - it may be reset once from the recorder thread if the audio is
+     *    disabled dynamically.
+     *
+     * Therefore, once the recorder thread is started, only the recorder thread
+     * may access it without data races.
+     */
+    bool audio;
+    bool video;
+
+    enum sc_orientation orientation;
+
     char *filename;
     enum sc_record_format format;
     AVFormatContext *ctx;
-    struct size declared_frame_size;
-    bool header_written;
 
-    SDL_Thread *thread;
-    SDL_mutex *mutex;
-    SDL_cond *queue_cond;
-    bool stopped; // set on recorder_stop() by the stream reader
-    bool failed; // set on packet write failure
-    struct recorder_queue queue;
+    sc_thread thread;
+    sc_mutex mutex;
+    sc_cond cond;
+    // set on sc_recorder_stop(), packet_sink close or recording failure
+    bool stopped;
+    struct sc_recorder_queue video_queue;
+    struct sc_recorder_queue audio_queue;
 
-    // we can write a packet only once we received the next one so that we can
-    // set its duration (next_pts - current_pts)
-    // "previous" is only accessed from the recorder thread, so it does not
-    // need to be protected by the mutex
-    struct record_packet *previous;
+    // wake up the recorder thread once the video or audio codec is known
+    bool video_init;
+    bool audio_init;
+
+    bool audio_expects_config_packet;
+
+    struct sc_recorder_stream video_stream;
+    struct sc_recorder_stream audio_stream;
+
+    const struct sc_recorder_callbacks *cbs;
+    void *cbs_userdata;
+};
+
+struct sc_recorder_callbacks {
+    void (*on_ended)(struct sc_recorder *recorder, bool success,
+                     void *userdata);
 };
 
 bool
-recorder_init(struct recorder *recorder, const char *filename,
-              enum sc_record_format format, struct size declared_frame_size);
-
-void
-recorder_destroy(struct recorder *recorder);
-
-bool
-recorder_open(struct recorder *recorder, const AVCodec *input_codec);
-
-void
-recorder_close(struct recorder *recorder);
+sc_recorder_init(struct sc_recorder *recorder, const char *filename,
+                 enum sc_record_format format, bool video, bool audio,
+                 enum sc_orientation orientation,
+                 const struct sc_recorder_callbacks *cbs, void *cbs_userdata);
 
 bool
-recorder_start(struct recorder *recorder);
+sc_recorder_start(struct sc_recorder *recorder);
 
 void
-recorder_stop(struct recorder *recorder);
+sc_recorder_stop(struct sc_recorder *recorder);
 
 void
-recorder_join(struct recorder *recorder);
+sc_recorder_join(struct sc_recorder *recorder);
 
-bool
-recorder_push(struct recorder *recorder, const AVPacket *packet);
+void
+sc_recorder_destroy(struct sc_recorder *recorder);
 
 #endif
